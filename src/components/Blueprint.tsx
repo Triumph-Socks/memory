@@ -1,15 +1,31 @@
-import { useMemo, useState } from "react";
-import exportRaw from "../server/export-archive.ts?raw";
-import schemaRaw from "../server/schema.prisma?raw";
-import serviceRaw from "../server/time-lock.service.ts?raw";
+import { useEffect, useMemo, useState } from "react";
 import { cn } from "../lib/utils";
 import { Btn, Reveal, SectionHead, toast } from "./ui";
+
+/**
+ * The three production artifacts live as real source files in src/server/.
+ * We reference them as static assets (new URL + import.meta.url) and fetch
+ * their text at runtime. This keeps them out of the JS module graph — no
+ * `?raw` module scripts, so nothing can fail MIME / module resolution.
+ */
+const SCHEMA_URL = new URL("../server/schema.prisma", import.meta.url).href;
+const SERVICE_URL = new URL("../server/time-lock.service.ts", import.meta.url).href;
+const EXPORT_URL = new URL("../server/export-archive.ts", import.meta.url).href;
 
 interface FileTab {
   name: string;
   lang: string;
   path: string;
+  url: string;
   body: string;
+  note: string;
+}
+
+interface FileMeta {
+  name: string;
+  lang: string;
+  path: string;
+  url: string;
   note: string;
 }
 
@@ -51,33 +67,33 @@ export default async function CapsulePage({ params }: Props) {
 //   3. 202 Accepted — receipt appended to release_log
 `;
 
-const FILES: FileTab[] = [
+const FILE_META: FileMeta[] = [
   {
     name: "schema.prisma",
     lang: "prisma",
     path: "src/server/schema.prisma",
-    body: schemaRaw,
+    url: SCHEMA_URL,
     note: "13 models — family graph, permission links, media pipeline, memoir transcripts, capsules, guardians.",
   },
   {
     name: "time-lock.service.ts",
     lang: "ts",
     path: "src/server/time-lock.service.ts",
-    body: serviceRaw,
+    url: SERVICE_URL,
     note: "Seal → schedule → verify → release → notify. Dual control with KMS; 2-of-2 guardian override.",
   },
   {
     name: "export-archive.ts",
     lang: "ts",
     path: "src/server/export-archive.ts",
-    body: exportRaw,
+    url: EXPORT_URL,
     note: "Longevity packager: manifest.json + offline HTML viewer + CSV + originals. 3-2-1 ritual in README.",
   },
   {
     name: "vault-dashboard.tsx",
     lang: "tsx",
     path: "app/vaults/[capsuleId]/page.tsx",
-    body: NEXT_WIRING,
+    url: "",
     note: "Next.js App Router wiring — server component fetches the envelope, client island decrypts ZK.",
   },
 ];
@@ -105,9 +121,43 @@ function highlight(code: string): string {
 
 export function Blueprint() {
   const [tab, setTab] = useState(0);
+  const [bodies, setBodies] = useState<Record<string, string> | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const fetchable = FILE_META.filter((f) => f.url);
+        const texts = await Promise.all(
+          fetchable.map((f) => fetch(f.url).then((r) => (r.ok ? r.text() : Promise.reject(r.statusText)))),
+        );
+        const map: Record<string, string> = {};
+        fetchable.forEach((f, i) => {
+          map[f.name] = texts[i];
+        });
+        if (!cancelled) setBodies(map);
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const FILES: FileTab[] = useMemo(
+    () =>
+      FILE_META.map((f) => ({
+        ...f,
+        body: f.name === "vault-dashboard.tsx" ? NEXT_WIRING : bodies?.[f.name] ?? "",
+      })),
+    [bodies],
+  );
+
   const file = FILES[tab];
   const html = useMemo(() => highlight(file.body), [file]);
-  const lines = file.body.split("\n").length;
+  const lines = file.body ? file.body.split("\n").length : 0;
 
   return (
     <section id="blueprint" className="relative py-24">
@@ -165,9 +215,25 @@ export function Blueprint() {
             </p>
             {/* code */}
             <div className="max-h-[520px] overflow-auto bg-[#0c150f]">
-              <pre className="p-5 font-mono text-[12px] leading-[1.7] whitespace-pre text-cream/90">
-                <code dangerouslySetInnerHTML={{ __html: html }} />
-              </pre>
+              {bodies === null && !failed ? (
+                <div className="flex h-[320px] flex-col items-center justify-center gap-3">
+                  <span className="pulse-dot h-2.5 w-2.5 rounded-full bg-sage-400" />
+                  <p className="font-mono text-[10px] tracking-[0.22em] text-cream-dim uppercase">
+                    Loading {file.name}…
+                  </p>
+                </div>
+              ) : failed ? (
+                <div className="flex h-[320px] items-center justify-center px-8 text-center">
+                  <p className="font-mono text-[11px] leading-relaxed text-blush-300">
+                    Couldn't fetch {file.path} from the build output. The source still ships in the
+                    repository — open it in your editor.
+                  </p>
+                </div>
+              ) : (
+                <pre className="p-5 font-mono text-[12px] leading-[1.7] whitespace-pre text-cream/90">
+                  <code dangerouslySetInnerHTML={{ __html: html }} />
+                </pre>
+              )}
             </div>
           </div>
         </Reveal>
