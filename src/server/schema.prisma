@@ -1,0 +1,440 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// MemoryLane — PostgreSQL schema (Prisma ORM)
+// Relational backbone for family trees, permission links, media pipelines,
+// memoir narration, and scheduled time-capsule releases.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Identity & family graph ─────────────────────────────────────────────────
+
+model User {
+  id            String          @id @default(cuid())
+  email         String          @unique
+  displayName   String
+  passwordHash  String?
+  webAuthnKeys  Json            @default("[]")
+  role          PlatformRole    @default(MEMBER)
+  lastActiveAt  DateTime?
+  createdAt     DateTime        @default(now())
+
+  memberships   FamilyMember[]
+  ownedGroups   FamilyGroup     @relation("GroupOwner")
+  albums        Album[]
+  media         MediaItem[]
+  stories       MemoirStory[]
+  capsules      TimeCapsule[]
+  guardianships LegacyGuardian[]
+  approvals     GuardianApproval[]
+  invites       Invite[]
+
+  @@index([lastActiveAt])
+  @@map("users")
+}
+
+enum PlatformRole {
+  MEMBER
+  ADMIN
+}
+
+model FamilyGroup {
+  id          String         @id @default(cuid())
+  name        String
+  slug        String         @unique
+  ownerId     String
+  owner       User           @relation("GroupOwner", fields: [ownerId], references: [id])
+  createdAt   DateTime       @default(now())
+
+  members     FamilyMember[]
+  albums      Album[]
+  stories     MemoirStory[]
+  capsules    TimeCapsule[]
+  guardians   LegacyGuardian[]
+
+  @@map("family_groups")
+}
+
+enum FamilyRole {
+  OWNER        // full sovereignty, key holder
+  CO_CURATOR   // administers members, seals capsules
+  CONTRIBUTOR  // uploads media, records narration
+  FAMILY       // view & annotate
+  PUBLIC       // read-only share-link principal
+}
+
+model FamilyMember {
+  familyId    String
+  userId      String
+  role        FamilyRole
+  grantedById String
+  joinedAt    DateTime       @default(now())
+
+  family      FamilyGroup    @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([familyId, userId])
+  @@index([userId])
+  @@map("family_members")
+}
+
+model Invite {
+  id          String         @id @default(cuid())
+  familyId    String
+  email       String
+  role        FamilyRole
+  tokenHash   String         @unique
+  invitedById String
+  invitedBy   User           @relation(fields: [invitedById], references: [id])
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+
+  @@index([familyId])
+  @@map("invites")
+}
+
+// ─── Albums & media pipeline ─────────────────────────────────────────────────
+
+enum PrivacyTier {
+  PIN_LOCKED   // end-to-end encrypted, PIN / passphrase sealed
+  FAMILY       // any family member
+  CONTRIBUTOR  // contributors and above
+  PUBLIC       // tokenised share link, view-only
+}
+
+model Album {
+  id          String         @id @default(cuid())
+  familyId    String
+  title       String
+  description String?
+  privacy     PrivacyTier    @default(FAMILY)
+  pinArgon2   String?        // Argon2id verifier for PIN_LOCKED albums
+  ownerId     String
+  owner       User           @relation(fields: [ownerId], references: [id])
+  createdAt   DateTime       @default(now())
+
+  family      FamilyGroup    @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  media       MediaItem[]
+  permissions AlbumPermission[]
+
+  @@index([familyId, privacy])
+  @@map("albums")
+}
+
+model AlbumPermission {
+  albumId     String
+  principal   String         // userId or "share:<tokenHash>"
+  canView     Boolean        @default(true)
+  canAnnotate Boolean        @default(false)
+  expiresAt   DateTime?
+
+  album       Album          @relation(fields: [albumId], references: [id], onDelete: Cascade)
+
+  @@id([albumId, principal])
+  @@map("album_permissions")
+}
+
+model MediaItem {
+  id            String         @id @default(cuid())
+  albumId       String
+  ownerId       String
+  owner         User           @relation(fields: [ownerId], references: [id])
+  storageKey    String         @unique        // s3://memorylane/<family>/<sha256>.bin
+  sha256        String         @unique        // content-addressed dedupe
+  mimeType      String
+  bytes         BigInt
+  aesKeyId      String                        // KMS envelope key id (AES-256 SSE)
+  exif          Json?                         // extracted GPS / capture date / camera
+  exifStripped  Boolean        @default(false)
+  capturedAt    DateTime?
+  decade        String?                       // denormalised for timeline queries
+  storyTags     String[]
+  status        MediaStatus    @default(PROCESSING)
+  createdAt     DateTime       @default(now())
+
+  album         Album          @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  derivatives   MediaDerivative[]
+  transcripts   AudioTranscript[]
+  storyPages    MemoirPage[]
+
+  @@index([albumId, capturedAt])
+  @@index([decade])
+  @@map("media_items")
+}
+
+enum MediaStatus {
+  PROCESSING
+  READY
+  FAILED
+}
+
+model MediaDerivative {
+  id          String       @id @default(cuid())
+  mediaId     String
+  variant     DerivVariant
+  storageKey  String
+  width       Int
+  height      Int
+  bytes       Int
+
+  media       MediaItem    @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+
+  @@unique([mediaId, variant])
+  @@map("media_derivatives")
+}
+
+enum DerivVariant {
+  THUMB_320
+  GRID_800
+  STORY_1600
+  ARCHIVAL_ORIGINAL
+}
+
+// ─── Memoirs, narration & transcripts ────────────────────────────────────────
+
+model MemoirStory {
+  id          String         @id @default(cuid())
+  familyId    String
+  narratorId  String
+  narrator    User           @relation(fields: [narratorId], references: [id])
+  title       String
+  prompt      String?                       // e.g. "Grandpa's first job"
+  status      StoryStatus    @default(DRAFT)
+  createdAt   DateTime       @default(now())
+  publishedAt DateTime?
+
+  family      FamilyGroup    @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  pages       MemoirPage[]
+
+  @@map("memoir_stories")
+}
+
+enum StoryStatus {
+  DRAFT
+  REVIEW
+  PUBLISHED
+  ARCHIVED
+}
+
+model MemoirPage {
+  id          String           @id @default(cuid())
+  storyId     String
+  position    Int
+  mediaId     String
+  kenBurns    KenBurnsPreset   @default(ZOOM_IN)
+  caption     String?
+
+  story       MemoirStory      @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  media       MediaItem        @relation(fields: [mediaId], references: [id])
+  transcripts AudioTranscript[]
+
+  @@unique([storyId, position])
+  @@map("memoir_pages")
+}
+
+enum KenBurnsPreset {
+  ZOOM_IN
+  ZOOM_OUT
+  PAN_LEFT
+  PAN_RIGHT
+}
+
+model AudioTranscript {
+  id            String         @id @default(cuid())
+  pageId        String?
+  mediaId       String                        // source audio MediaItem
+  engine        String         @default("whisper-1")
+  language      String         @default("en")
+  fullText      String
+  wordCount     Int
+  confidence    Float?
+  status        TranscriptStatus @default(QUEUED)
+  jobId         String?        @unique        // async Whisper job id
+
+  page          MemoirPage?    @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  media         MediaItem      @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  segments      TranscriptSegment[]
+
+  @@map("audio_transcripts")
+}
+
+enum TranscriptStatus {
+  QUEUED
+  TRANSCRIBING
+  SYNCED
+  FAILED
+}
+
+model TranscriptSegment {
+  id            String          @id @default(cuid())
+  transcriptId  String
+  startMs       Int
+  endMs         Int
+  text          String
+  highlightRef  String?         // photo region or story beat it syncs to
+
+  transcript    AudioTranscript @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+
+  @@index([transcriptId, startMs])
+  @@map("transcript_segments")
+}
+
+// ─── Time capsules & the time-lock engine ────────────────────────────────────
+
+enum CapsuleStatus {
+  SEALED
+  RELEASE_SCHEDULED
+  RELEASED
+  EMERGENCY_RELEASED
+  REVOKED
+}
+
+enum UnlockMechanism {
+  SCHEDULED_KMS      // serverless worker releases envelope key at T_unlock
+  ZERO_KNOWLEDGE     // client-side AES-256-GCM; platform never sees plaintext
+  GUARDIAN_2_OF_2    // emergency path
+}
+
+model TimeCapsule {
+  id            String           @id @default(cuid())
+  familyId      String
+  ownerId       String
+  owner         User             @relation(fields: [ownerId], references: [id])
+  recipientId   String?
+  label         String
+  milestone     String
+  unlockAt      DateTime                      // T_unlock — immutable once sealed
+  sealedAt      DateTime         @default(now())
+  status        CapsuleStatus    @default(SEALED)
+  mechanism     UnlockMechanism  @default(SCHEDULED_KMS)
+  zeroKnowledge Boolean          @default(false)
+
+  // Crypto envelope (server path). For zeroKnowledge capsules only
+  // `kdfParams` + ciphertext fingerprint are stored — never key material.
+  kmsKeyId      String?
+  wrappedDek    Bytes?                          // KMS-wrapped data-encryption key
+  iv            Bytes?
+  ciphertext    Bytes?
+  fingerprint   String?            @unique      // sha256(ciphertext) public audit trail
+  kdfParams     Json?                           // PBKDF2/Argon2 params for ZK path
+
+  failedAttempts Int               @default(0)
+
+  family        FamilyGroup        @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  contents      CapsuleContent[]
+  unlockJob     MilestoneUnlock?
+  approvals     GuardianApproval[]
+  releaseLog    ReleaseLogEntry[]
+
+  @@index([status, unlockAt])
+  @@index([familyId])
+  @@map("time_capsules")
+}
+
+model CapsuleContent {
+  id          String      @id @default(cuid())
+  capsuleId   String
+  kind        ContentKind
+  refId       String?     // MediaItem / AudioTranscript id when applicable
+  inlineCipher Bytes?     // encrypted letter body for ZK capsules
+  note        String?
+
+  capsule     TimeCapsule @relation(fields: [capsuleId], references: [id], onDelete: Cascade)
+
+  @@map("capsule_contents")
+}
+
+enum ContentKind {
+  LETTER
+  PHOTO
+  VIDEO
+  VOICE_NOTE
+  DOCUMENT
+}
+
+model MilestoneUnlock {
+  capsuleId      String       @id
+  runAt          DateTime                    // == TimeCapsule.unlockAt, guarded by check
+  jobId          String?      @unique        // EventBridge / CloudScheduler handle
+  leaseOwner     String?                     // worker id holding the execution lease
+  leaseExpiresAt DateTime?
+  attempts       Int          @default(0)
+  lastError      String?
+  firedAt        DateTime?
+
+  capsule        TimeCapsule  @relation(fields: [capsuleId], references: [id], onDelete: Cascade)
+
+  @@index([runAt, firedAt])
+  @@map("milestone_unlocks")
+}
+
+// ─── Guardians & inheritance protocol ────────────────────────────────────────
+
+enum GuardianStatus {
+  INVITED
+  ACTIVE
+  REVOKED
+}
+
+model LegacyGuardian {
+  id            String          @id @default(cuid())
+  familyId      String
+  userId        String?
+  email         String
+  displayName   String
+  status        GuardianStatus  @default(INVITED)
+  contactPolicy Json                          // channel ladder: sms, registered mail, courier
+  publicKey     String?                       // guardian's encryption key for recovery packs
+  lastVerifiedAt DateTime?
+  appointedAt   DateTime        @default(now())
+
+  family        FamilyGroup     @relation(fields: [familyId], references: [id], onDelete: Cascade)
+  user          User?           @relation(fields: [userId], references: [id])
+  approvals     GuardianApproval[]
+
+  @@unique([familyId, email])
+  @@map("legacy_guardians")
+}
+
+enum ApprovalDecision {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model GuardianApproval {
+  id           String             @id @default(cuid())
+  capsuleId    String
+  guardianId   String
+  decision     ApprovalDecision   @default(PENDING)
+  evidenceRef  String?            // e.g. verified document sha256
+  decidedAt    DateTime?
+
+  capsule      TimeCapsule        @relation(fields: [capsuleId], references: [id], onDelete: Cascade)
+  guardian     LegacyGuardian     @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+  requestedBy  User               @relation(fields: [requestedById], references: [id])
+  requestedById String
+
+  @@unique([capsuleId, guardianId])
+  @@map("guardian_approvals")
+}
+
+model ReleaseLogEntry {
+  id         String      @id @default(cuid())
+  capsuleId  String
+  actor      String      // "scheduler" | "guardian:<id>" | "owner"
+  action     String      // "key_released" | "emergency_open" | "tamper_alert"
+  metadata   Json?
+  at         DateTime    @default(now())
+
+  capsule    TimeCapsule @relation(fields: [capsuleId], references: [id], onDelete: Cascade)
+
+  @@index([capsuleId, at])
+  @@map("release_log")
+}
